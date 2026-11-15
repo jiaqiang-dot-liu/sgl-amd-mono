@@ -87,6 +87,7 @@ class _Serving:
     SERVER_ARGS: list
     PARALLEL: int
     RUNS: str  # the startup line: the steps the FFN launches run
+    EXTRA_ENV: dict = {}
 
     @classmethod
     def setUpClass(cls):
@@ -94,7 +95,10 @@ class _Serving:
             tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err")
         )
         cls.process = _launch(
-            cls.SERVER_ARGS, extra_args=["--watchdog-timeout", "600"], log=cls.logs
+            cls.SERVER_ARGS,
+            extra_env=cls.EXTRA_ENV,
+            extra_args=["--watchdog-timeout", "600"],
+            log=cls.logs,
         )
 
     @classmethod
@@ -134,6 +138,16 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
         self.assertIn(
             "M3.1 DSpark draft: the sampled Markov block in the gfx950 kernels", log
         )
+
+
+class TestMonokernelVerifyGpuLens(TestMonokernelVerify):
+    """The verify server with SGLANG_AMD_MONO_M31_GPU_LENS=1: decode and verify steps
+    without the host's seq_lens copy, eager ones above the graphs' batch sizes too."""
+
+    EXTRA_ENV = {"SGLANG_AMD_MONO_M31_GPU_LENS": "1"}
+
+    def test_the_steps_keep_seq_lens_on_the_gpu(self):
+        self.assertIn("M3.1: decode steps keep seq_lens on the GPU", _logs(self.logs))
 
 
 class TestMonokernelDecode(_Serving, CustomTestCase):
