@@ -27,7 +27,10 @@ SGLANG_READS = {
         "_linear_verify",
         "max_context_len",
     ),
-    "srt/managers/overlap_utils.py": ("decide_needs_cpu_seq_lens", '"needs_cpu_seq_lens"'),
+    "srt/managers/overlap_utils.py": (
+        "decide_needs_cpu_seq_lens",
+        '"needs_cpu_seq_lens"',
+    ),
 }
 
 
