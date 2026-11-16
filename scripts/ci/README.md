@@ -88,9 +88,13 @@ package: its speed is compared against the off side.
 The PR test's status fails when:
 
 - a test fails, or a serving test, benchmark or server does not finish. A unit
-  test that fails on the base branch too (its merge-base, run the same way) is
-  the base branch's: when every unit failure is one, the Tests check warns and
-  names them instead of failing. The nightly has no base, so it fails on any;
+  test that fails on the base branch too (its merge-base, run the same way) with
+  the same exception type is the base branch's: when every unit failure is one,
+  the Tests check warns and names them instead of failing. The two sides are
+  compared only when pytest ran every test on both (exit code 0 or 1; a file
+  that does not import stops the run early) and the base branch installed;
+  otherwise the check says why and any failure fails, as in the nightly, which
+  has no base;
 - the monokernel server logs no routing (every step ran SGLang's own path);
 - GSM8K (and GPQA, with `run-ci-extra`) loses significantly with the monokernels
   on: of the questions the on and off runs answer differently, the on run gets

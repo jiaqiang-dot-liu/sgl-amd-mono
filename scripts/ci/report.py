@@ -239,34 +239,37 @@ def perf_check(key, r, needs_gain):
     )
 
 
-def _base_ids(r, name, c):
-    """The PR's and the base branch's failing test ids for ``name``, or None when
-    the run has no base tests to compare (nightly, or either side failed whole)."""
+# pytest's exit codes whose junit XML holds every test: all passed (0) or some
+# failed (1). A file that does not import stops the run before any test (2), and
+# "no tests collected" is 5: matching those against the base proves nothing.
+COMPARABLE_RC = (0, 1)
+
+
+def compare_base(r, name, c):
+    """Hold the PR's failing ``name`` tests against the base branch's.
+
+    Returns ``(new, why)``: ``new`` lists the PR's failures the base branch does
+    not have, or has failing another way (another exception type). When the two
+    cannot be compared, ``new`` is None and ``why`` says why (None when the run
+    has no base tests at all: the nightly, or tests the base side does not run).
+    """
     b = r.get("base_tests", {}).get(name)
-    if (
-        not b
-        or "failed_ids" not in b
-        or "failed_ids" not in c
-        or c.get("timeout")
-        or b.get("timeout")
-        or len(c["failed_ids"]) != c["failed"]
-    ):
-        return None
-    return set(c["failed_ids"]), set(b["failed_ids"])
+    if b is None:
+        return None, None
+    if b.get("error"):
+        return None, b["error"]
+    for side, x in (("this PR", c), ("the base branch", b)):
+        if x.get("rc") not in COMPARABLE_RC:
+            return None, f"pytest exited {x.get('rc')} on {side}"
+        if len(x.get("failed_ids", [])) != x["failed"]:
+            return None, f"no per-test results on {side}"
+    pr, base = _kinds(c), _kinds(b)
+    return sorted(i for i in pr if i not in base or pr[i] != base[i]), None
 
 
-def base_failures(r, name, c):
-    """The PR's failures when every one of them also fails on the base branch."""
-    ids = _base_ids(r, name, c)
-    if not c["failed"] or ids is None or not ids[0] <= ids[1]:
-        return None
-    return sorted(ids[0])
-
-
-def new_failures(r, name, c):
-    """The PR's failures the base branch does not have, when both sides compare."""
-    ids = _base_ids(r, name, c)
-    return None if ids is None else sorted(ids[0] - ids[1])
+def _kinds(c):
+    kinds = c.get("failed_kinds", {})
+    return {i: kinds.get(i) for i in c["failed_ids"]}
 
 
 def _names(ids, n=3):
@@ -294,22 +297,24 @@ def tests_check(key, r):
             parts.append(f"{name}: did not run")
             continue
         s = f"{name} {c['passed']} passed"
-        inherited = base_failures(r, name, c)
-        if inherited is not None:
-            # every failure also fails on the base branch: the PR's tests pass
+        new, why = compare_base(r, name, c) if c["failed"] else (None, None)
+        if new == []:
+            # every failure also fails on the base branch, the same way: the
+            # PR's tests pass
             states.append(WARN)
             s += (
                 f", {c['failed']} failed, all also on the base branch"
-                f" (not this PR's): {_names(inherited)}"
+                f" (not this PR's): {_names(c['failed_ids'])}"
             )
         elif c["failed"]:
             states.append(FAIL)
             s += f", **{c['failed']} failed**" + (
                 " (timed out)" if c.get("timeout") else ""
             )
-            new = new_failures(r, name, c)
             if new is not None:
                 s += f" ({len(new)} new: {_names(new)})"
+            elif why:
+                s += f" (not compared with the base branch: {why})"
         else:
             states.append(PASS)
         if c["skipped"]:

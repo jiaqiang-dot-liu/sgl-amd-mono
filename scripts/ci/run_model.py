@@ -95,6 +95,19 @@ def per_question(run_dir):
     return {q: right[q] / seen[q] for q in seen}
 
 
+def failure_kind(el):
+    """How a test failed, from its junit ``<failure>``/``<error>`` element: the
+    exception type its message names (``ValueError``, ``ImportError`` for a
+    fixture's), ``AssertionError`` for a bare ``assert``, else the tag. Only the
+    type: the message itself holds values, addresses and paths that change from
+    run to run."""
+    msg = (el.get("message") or "").strip()
+    if msg.startswith("assert "):
+        return "AssertionError"
+    m = re.search(r"\b(\w*(?:Error|Exception|Exit|Interrupt)|Failed)\b", msg)
+    return m.group(1) if m else el.tag
+
+
 class Run:
     def __init__(self, args):
         self.args = args
@@ -119,6 +132,7 @@ class Run:
             "accuracy": {},
             "routing": {},
         }
+        self.installed = None  # the checkout install() last installed
         for k, v in self.m.get("paths", {}).items():
             os.environ[k] = v
 
@@ -162,9 +176,14 @@ class Run:
         return rc
 
     def install(self, src):
-        """Make ``src`` the installed sgl-amd-mono, with its own kernel cache."""
+        """Make ``src`` the installed sgl-amd-mono, with its own kernel cache. A
+        no-op when ``src`` is already installed (the base tests, then the base
+        side)."""
         side = Path(src).name
         os.environ["SGLANG_AMD_MONO_CACHE_DIR"] = f"/tmp/sgl-amd-mono-cache-{side}"
+        if self.installed == str(src):
+            return
+        self.installed = None
         rc = self.sh(
             "pip uninstall -y -q sgl-amd-mono; "
             f"pip install -q --no-deps --no-build-isolation -e {shlex.quote(str(src))}",
@@ -172,6 +191,7 @@ class Run:
         )
         if rc:
             raise RuntimeError(f"installing {src} failed")
+        self.installed = str(src)
 
     # -- tests ----------------------------------------------------------------
 
@@ -191,20 +211,24 @@ class Run:
             timeout=timeout,
         )
         counts = {"passed": 0, "failed": 0, "skipped": 0, "rc": rc}
-        failed_ids = []
+        kinds = {}
         if xml.exists():
             for case in ET.parse(xml).getroot().iter("testcase"):
-                tags = {c.tag for c in case}
-                if tags & {"failure", "error"}:
+                bad = [c for c in case if c.tag in ("failure", "error")]
+                if bad:
                     counts["failed"] += 1
-                    failed_ids.append(f"{case.get('classname')}::{case.get('name')}")
-                elif "skipped" in tags:
+                    kinds[f"{case.get('classname')}::{case.get('name')}"] = (
+                        failure_kind(bad[0])
+                    )
+                elif any(c.tag == "skipped" for c in case):
                     counts["skipped"] += 1
                 else:
                     counts["passed"] += 1
-            # every failure by id, so the report can tell the PR's own from the
-            # base branch's (a run that failed whole has none: it judges by count)
-            counts["failed_ids"] = sorted(failed_ids)
+            # every failure by id and how it failed, so the report can tell the
+            # PR's own from the base branch's (a run that failed whole has none:
+            # it judges by count)
+            counts["failed_ids"] = sorted(kinds)
+            counts["failed_kinds"] = kinds
         elif rc:
             counts["failed"] = 1  # collection or the run itself failed
         if rc == 124:
@@ -659,8 +683,16 @@ class Run:
 
     def base_tests(self):
         """The base branch's unit tests, so the PR is held only to the failures it
-        adds: one that fails on the base too is the base branch's, not the PR's."""
-        self.install(self.args.base)
+        adds: one that fails on the base too is the base branch's, not the PR's.
+        Not installing the base turns the comparison off rather than failing the
+        PR, which may be the fix for that install."""
+        try:
+            self.install(self.args.base)
+        except RuntimeError as e:
+            self.result.setdefault("base_tests", {})["unit"] = {"error": str(e)}
+            self.log(f"{e}: the unit tests are not compared with the base branch")
+            self.save()
+            return
         self.pytest("unit", ["test/unit"], 1800, src=self.args.base, into="base_tests")
 
     def step(self, name, fn, *args, **kwargs):
