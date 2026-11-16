@@ -92,8 +92,8 @@ The PR test's status fails when:
   the same exception type is the base branch's: when every unit failure is one,
   the Tests check warns and names them instead of failing. The two sides are
   compared only when pytest ran every test on both (exit code 0 or 1; a file
-  that does not import stops the run early) and the base branch installed;
-  otherwise the check says why and any failure fails, as in the nightly, which
+  that does not import stops the run early), the base branch installed and
+  its junit XML parsed; otherwise the check says why and any failure fails, as in the nightly, which
   has no base;
 - the monokernel server logs no routing (every step ran SGLang's own path);
 - GSM8K (and GPQA, with `run-ci-extra`) loses significantly with the monokernels

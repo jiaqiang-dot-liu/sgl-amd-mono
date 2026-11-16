@@ -133,6 +133,7 @@ class Run:
             "routing": {},
         }
         self.installed = None  # the checkout install() last installed
+        self.install_failed = {}  # checkout -> why its install failed
         for k, v in self.m.get("paths", {}).items():
             os.environ[k] = v
 
@@ -183,6 +184,8 @@ class Run:
         os.environ["SGLANG_AMD_MONO_CACHE_DIR"] = f"/tmp/sgl-amd-mono-cache-{side}"
         if self.installed == str(src):
             return
+        if str(src) in self.install_failed:  # the same pip run would fail again
+            raise RuntimeError(self.install_failed[str(src)])
         self.installed = None
         rc = self.sh(
             "pip uninstall -y -q sgl-amd-mono; "
@@ -190,7 +193,8 @@ class Run:
             f"install-{side}",
         )
         if rc:
-            raise RuntimeError(f"installing {src} failed")
+            self.install_failed[str(src)] = f"installing {src} failed"
+            raise RuntimeError(self.install_failed[str(src)])
         self.installed = str(src)
 
     # -- tests ----------------------------------------------------------------
@@ -213,17 +217,22 @@ class Run:
         counts = {"passed": 0, "failed": 0, "skipped": 0, "rc": rc}
         kinds = {}
         if xml.exists():
+            # one state per test id: a test that fails and then errors in its
+            # teardown has two <testcase> entries, and counts once, as failed,
+            # the way its call failed
+            state = {}
             for case in ET.parse(xml).getroot().iter("testcase"):
+                tid = f"{case.get('classname')}::{case.get('name')}"
                 bad = [c for c in case if c.tag in ("failure", "error")]
                 if bad:
-                    counts["failed"] += 1
-                    kinds[f"{case.get('classname')}::{case.get('name')}"] = (
-                        failure_kind(bad[0])
-                    )
+                    state[tid] = "failed"
+                    kinds.setdefault(tid, failure_kind(bad[0]))
                 elif any(c.tag == "skipped" for c in case):
-                    counts["skipped"] += 1
+                    state.setdefault(tid, "skipped")
                 else:
-                    counts["passed"] += 1
+                    state.setdefault(tid, "passed")
+            for st in state.values():
+                counts[st] += 1
             # every failure by id and how it failed, so the report can tell the
             # PR's own from the base branch's (a run that failed whole has none:
             # it judges by count)
@@ -684,16 +693,20 @@ class Run:
     def base_tests(self):
         """The base branch's unit tests, so the PR is held only to the failures it
         adds: one that fails on the base too is the base branch's, not the PR's.
-        Not installing the base turns the comparison off rather than failing the
-        PR, which may be the fix for that install."""
+        Not installing the base, or not reading its results, turns the comparison
+        off rather than failing the PR, which may be the fix for that install."""
         try:
             self.install(self.args.base)
-        except RuntimeError as e:
-            self.result.setdefault("base_tests", {})["unit"] = {"error": str(e)}
-            self.log(f"{e}: the unit tests are not compared with the base branch")
+            self.pytest(
+                "unit", ["test/unit"], 1800, src=self.args.base, into="base_tests"
+            )
+        except (RuntimeError, ET.ParseError) as e:
+            why = str(e)
+            if isinstance(e, ET.ParseError):
+                why = f"the base branch's junit XML does not parse ({e})"
+            self.result.setdefault("base_tests", {})["unit"] = {"error": why}
+            self.log(f"{why}: the unit tests are not compared with the base branch")
             self.save()
-            return
-        self.pytest("unit", ["test/unit"], 1800, src=self.args.base, into="base_tests")
 
     def step(self, name, fn, *args, **kwargs):
         """Run one step; an exception is recorded (the report fails on it) and the
