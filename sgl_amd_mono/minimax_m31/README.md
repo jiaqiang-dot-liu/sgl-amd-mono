@@ -19,7 +19,8 @@ token before them.
 | KV cache | SGLang's NVFP4 pool (`MiniMaxM3Nvfp4KVPool`), page size 128 |
 | other steps | SGLang's forward runs prefill, extend and the steps wider than 16 rows |
 
-The model has 60 layers. Layers 0 to 2 are dense. Layers 3 to 59 are the 57 sparse layers.
+The model has 60 layers, and each layer has sparse attention. Layers 0 to 2 have a dense FFN. Layers 3 to 59 have the
+MoE: this document calls them the 57 sparse layers.
 
 | file | contents |
 | --- | --- |
@@ -47,7 +48,8 @@ The model has 60 layers. Layers 0 to 2 are dense. Layers 3 to 59 are the 57 spar
 
 ## 2. A step
 
-In a routed step, `_Built.forward` runs SGLang's embedding and the 3 dense layers. Then it runs each sparse layer:
+In a routed step, `_Built.forward` runs SGLang's embedding and the 3 layers with a dense FFN. Then it runs each
+sparse layer:
 
 1. Layer 3: SGLang runs the input norm and the attention. Layers 4 to 59: K1 runs the input norm and the attention
    front (section 4).
