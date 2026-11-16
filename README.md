@@ -238,6 +238,7 @@ sgl-amd-mono/
 │   │   ├── weights.py   # the layer views the kernels read
 │   │   └── gfx950/      # kernels and launch runner
 │   ├── minimax_m31/
+│   │   ├── README.md    # the launches, the files, the tests and the switches
 │   │   ├── spec.py      # spec and forward
 │   │   ├── ffn.py       # the FFN launch (from vLLM)
 │   │   ├── front.py     # K1: the attention front
