@@ -408,6 +408,20 @@ def oproj(c, task):
         ]
         for tt in range(OP_TILES)
     ]
+    # the epilogue's weight scales are inputs: out behind the weights, not a
+    # round trip after the reduction (n clamped: e past the tiles is never used)
+    wss = [
+        fx.Float32(
+            bo.buffer_load(
+                rsrc(a["wos"]),
+                nb * 16
+                + fx.min((tid + e0) // 256 * 16 + (tid + e0) % 16, OP_TILES * 16 - 1),
+                vec_width=1,
+                dtype=T.f32,
+            )
+        )
+        for e0 in range(0, OP_TILES * 256, THREADS)
+    ]
     if tid < 16:
         fx.ptr_store(fx.Int32(0), pool + (OP_AMAX + tid))
     gpu.barrier()
@@ -467,8 +481,8 @@ def oproj(c, task):
             )
     gpu.barrier()
     # MFMA C: element tt 256 + r 64 + l is row 4 (l / 16) + r, column 16 tt + l % 16
-    for e0 in range_constexpr(0, OP_TILES * 256, THREADS):
-        e = tid + e0
+    for j in range_constexpr(len(wss)):
+        e = tid + j * THREADS
         m = (e % 64) // 16 * 4 + e % 256 // 64
         n = e // 256 * 16 + e % 16
         if (e < OP_TILES * 256) & (m < s):
@@ -484,9 +498,7 @@ def oproj(c, task):
                         )
                     )
             amax = fx.ptr_load(pool + (OP_AMAX + m)).bitcast(fx.Float32)
-            ws = fx.Float32(
-                bo.buffer_load(rsrc(a["wos"]), nb * 16 + n, vec_width=1, dtype=T.f32)
-            )
+            ws = wss[j]
             sc = (amax * fx.Float32(INV_FP8_MAX)) * ws
             fx.ptr_store(
                 bf16_round(v * sc), fpool + (OP_PART + m * 3 * TASK_TRIPLES + n)
@@ -504,11 +516,12 @@ def stage_reduce(c, task):
     if tid < s * TASK_TRIPLES:
         t = tid // TASK_TRIPLES
         tr = task * TASK_TRIPLES + tid % TASK_TRIPLES
+        # the residual is an input: out before the poll, not a round trip after it
+        res = triple_bits(a["res_in"], t, tr)
         got = c["mb"].poll(
             [(c["own"], attn_pair(c, src, t, tr), 1) for src in range(c["tp"])],
             triples=True,
         )
-        res = triple_bits(a["res_in"], t, tr)
         col = t * HIDDEN + 3 * tr
         for k in range_constexpr(3):
             word = [got[src][0][k // 2] for src in range(c["tp"])]
@@ -530,6 +543,10 @@ def stage_reduce(c, task):
 def stage_norm(c, t):
     """Token t's Gemma RMSNorm of SRES -> XN, then XRDY."""
     tid = c["tid"]
+    per = HIDDEN // THREADS  # 12
+    cols = [(q * THREADS + tid) * 2 for q in range(per // 2)]
+    # the Gemma weights are inputs: out before the SSQ wait
+    nws = [norm_w_words(c, col, 2) for col in cols]
     part = fx.Float32(0.0)
     if tid < SEAM_TASKS:
         got = c["mb"].poll([(c["ssq"], t * SEAM_TASKS + tid, 1)])
@@ -541,27 +558,36 @@ def stage_norm(c, t):
     # released after the SSQ acquires: the router reads SRES on it, not on XRDY
     if tid == 0:
         c["mb"].publish(c["rstd"], t, rstd)
-    per = HIDDEN // THREADS  # 12
+    # every SRES load out before a store: one round trip, not one a pair
+    svs = [load_dev(c["sres"].value, t * HIDDEN + col, 2) for col in cols]
+    rocdl.sched_barrier(0)
     for q in range_constexpr(per // 2):
-        col = (q * THREADS + tid) * 2
         store_dev(
-            c["xn"].value, t * (HIDDEN // 2) + col // 2, xn_words(c, t, col, rstd, 2)
+            c["xn"].value,
+            t * (HIDDEN // 2) + cols[q] // 2,
+            xn_words(svs[q], nws[q], rstd, 2),
         )
     flag_after_stores(c, c["xrdy"], t, tid == 0)
 
 
-def xn_words(c, t, col, rstd, n):
-    """XN[t][col .. col + n) from SRES: bf16 pairs of the Gemma RMSNorm, one word
-    a pair."""
-    sv = load_dev(c["sres"].value, t * HIDDEN + col, n)
-    words = []
-    for h in range_constexpr(n // 2):
-        ww = fx.Int32(
+def norm_w_words(c, col, n):
+    """The Gemma weight's bf16 pairs at columns col .. col + n, one word a pair."""
+    return [
+        fx.Int32(
             bo.buffer_load(
                 rsrc(c["args"]["norm_w"]), col // 2 + h, vec_width=1, dtype=T.i32
             )
         )
-        wl, wh = bf2_f32(ww)
+        for h in range(n // 2)
+    ]
+
+
+def xn_words(sv, nw, rstd, n):
+    """XN columns col .. col + n from their SRES ``sv`` and Gemma weight words
+    ``nw`` (``norm_w_words``): bf16 pairs of the Gemma RMSNorm, one word a pair."""
+    words = []
+    for h in range_constexpr(n // 2):
+        wl, wh = bf2_f32(nw[h])
         ol = fx.Int32(sv[2 * h]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wl)
         oh = fx.Int32(sv[2 * h + 1]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wh)
         words.append(bf16_pair(ol, oh).bitcast(fx.Int32))
@@ -654,11 +680,17 @@ def stage_router(c, task):
         for ch in range(chunks)
     ]
     tok = fx.min(lane % 16, s - 1)
+    nws = [norm_w_words(c, k0 + 16 * ch, 4) for ch in range(chunks)]
     # the norm's scale, published before XN: the router normalizes its own columns
     got = c["mb"].poll([(c["rstd"], tok, 1)])
     c["mb"].acquire(Space.SCRATCH)
     rstd = got[0][0].bitcast(fx.Float32)
-    xv = [xn_words(c, tok, k0 + 16 * ch, rstd, 4) for ch in range(chunks)]
+    svs = [
+        load_dev(c["sres"].value, tok * HIDDEN + k0 + 16 * ch, 4)
+        for ch in range(chunks)
+    ]
+    rocdl.sched_barrier(0)
+    xv = [xn_words(svs[ch], nws[ch], rstd, 4) for ch in range(chunks)]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for ch in range_constexpr(chunks):
         for h in range_constexpr(2):
