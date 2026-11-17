@@ -125,8 +125,16 @@ assert UP_WAVE_STEPS * WAVES == K1_STEPS and UP_WAVE_STEPS % 2 == 0
 # CTA bases of the stages placed by count
 NORM0 = FINAL_TASKS
 ROUTER0 = NORM0 + MAX_TOKENS
-SHARED0 = (ROUTER0 + ROUTER_TASKS) % BLOCKS
+# the shared expert's CTAs (128 .. 175) have no prefix task (push and reduce
+# 0 .., norm and route NORM0 .., the router ROUTER0 .. 79): its weights stream
+# from the launch's start
+SHARED0 = SEAM_TASKS
 ROUTED0 = SHARED0 + UP_TILES
+assert SHARED0 + UP_TILES <= NORM0
+assert (ROUTER0 + ROUTER_TASKS) % BLOCKS <= SEAM_TASKS
+# a shared CTA's first routed unit: NONSHARED ..; the down tasks past a CTA's own
+NONSHARED = BLOCKS - UP_TILES
+EXTRA_TASKS = DOWN_TASKS - BLOCKS
 
 # a triple pair's 16-bit tags over its parity's launches: 1 .. TAG16_CYCLE, never
 # the 0 a cleared half holds
@@ -991,7 +999,8 @@ def down_slot(c, u, tasks, shared=False):
             for q in range_constexpr(4):
                 fx.ptr_store(
                     acc[q],
-                    c["contrib"] + ((ti * 80 + pick) * 16 + 4 * (lane // 16) + q),
+                    c["contrib"]
+                    + ((ti * picks(c["S"]) + pick) * 16 + 4 * (lane // 16) + q),
                 )
 
 
@@ -1054,12 +1063,16 @@ def stage_down(c, tasks):
             tot = fx.Float32(0.0)
             if const_expr(c["experts"] != Experts.ROUTED):
                 tot = bf16_round(
-                    fx.ptr_load(c["contrib"] + ((ti * 80 + TOPK * s + t) * 16 + r))
+                    fx.ptr_load(
+                        c["contrib"] + ((ti * picks(s) + TOPK * s + t) * 16 + r)
+                    )
                 )
             if const_expr(c["experts"] != Experts.SHARED):
                 for k in range_constexpr(TOPK):
                     w = tab_ld(c, T_PICK_W + t * TOPK + k).bitcast(fx.Float32)
-                    v = fx.ptr_load(c["contrib"] + ((ti * 80 + t * TOPK + k) * 16 + r))
+                    v = fx.ptr_load(
+                        c["contrib"] + ((ti * picks(s) + t * TOPK + k) * 16 + r)
+                    )
                     tot = bf16_round(tot + bf16_round(w * v))
             vals.append(row_valid(c, t).select(tot, fx.Float32(0.0)))
         word = bf16_pair(vals[0], vals[1]).bitcast(fx.Int32)
@@ -1067,6 +1080,47 @@ def stage_down(c, tasks):
         for p in range_constexpr(c["tp"]):
             put_word(c, c["peer"][p], ffn_pair(c, c["rank"], t, cp), word)
     gpu.barrier()
+
+
+@flyc.jit
+def stage_down_placed(c, bid, first, total):
+    """Down task ``bid`` on every CTA; tasks BLOCKS .. DOWN_TASKS on the CTAs that
+    finish the up stage first, a bijection onto them. Round robin gives the CTAs
+    with ``first`` >= ``total % BLOCKS`` one unit fewer (the light ones); the
+    shared CTAs (``first`` >= ``NONSHARED``) carry the shared expert's unit too.
+    One row: a light CTA has no unit and waits on the others' up stage, so it
+    takes two of them. Up to 8 rows, the shared CTAs come between the light and
+    the heavy ones, past that (16 columns of MXFP8, X from global) last."""
+    s = c["S"]
+    r = total % BLOCKS
+    if const_expr(s > XN_LDS_TOKENS):
+        rs = fx.min(r, NONSHARED)
+        rel = (first - rs + NONSHARED) % NONSHARED
+        rel = (first < NONSHARED).select(rel, first)
+        if rel < EXTRA_TASKS:
+            stage_down(c, [bid, BLOCKS + rel])
+        else:
+            stage_down(c, [bid])
+    elif const_expr(s == 1):
+        light = BLOCKS - r
+        rel = (first - r + BLOCKS) % BLOCKS
+        if (light < EXTRA_TASKS) & (2 * light >= EXTRA_TASKS):
+            if rel < EXTRA_TASKS - light:
+                stage_down(c, [bid, BLOCKS + rel, BLOCKS + light + rel])
+            elif rel < light:
+                stage_down(c, [bid, BLOCKS + rel])
+            else:
+                stage_down(c, [bid])
+        elif rel < EXTRA_TASKS:
+            stage_down(c, [bid, BLOCKS + rel])
+        else:
+            stage_down(c, [bid])
+    else:
+        rel = (first - r + BLOCKS) % BLOCKS
+        if rel < EXTRA_TASKS:
+            stage_down(c, [bid, BLOCKS + rel])
+        else:
+            stage_down(c, [bid])
 
 
 @flyc.jit
@@ -1127,23 +1181,21 @@ def run_ffn(c, bid):
         shared_slot(c)
         stage_up(c, 0, sh, weights, shared=True)
     stamp(c, 6)
+    # the router no longer orders XN before the table; a shared CTA has it in LDS.
+    # XRDY lands before the picks: XN's copy runs while route does
+    if sh >= UP_TILES:
+        await_x(c, s)
     load_table(c)
     total = (n_slots(c) - 1) * UP_TILES
     first = first_task(bid, ROUTED0)
     weights = unit_weights(c, first)
-    # the router no longer orders XN before the table; a shared CTA has it in LDS
-    if sh >= UP_TILES:
-        await_x(c, s)
     stamp(c, 7)
     for unit in range(first, total, BLOCKS):
         weights = stage_up(
             c, 1 + unit // UP_TILES, unit % UP_TILES, weights, nxt=unit + BLOCKS
         )
     stamp(c, 8)
-    if bid < DOWN_TASKS - BLOCKS:
-        stage_down(c, [bid, bid + BLOCKS])
-    else:
-        stage_down(c, [bid])
+    stage_down_placed(c, bid, first, total)
     stamp(c, 9)
     for task in range(first_task(bid, 0), FINAL_TASKS, BLOCKS):
         stage_final(c, task)
@@ -1174,7 +1226,9 @@ def build_ffn(key: FfnBuild):
     class Lds:
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
         tab: fx.Array[fx.Int32, T_WORDS, 16]
-        contrib: fx.Array[fx.Float32, 2 * 80 * 16, 16]
+        # a down task's columns: every pick's 16 rows (``stage_down_placed``:
+        # up to three tasks at one row, two otherwise)
+        contrib: fx.Array[fx.Float32, (3 if s == 1 else 2) * picks(s) * 16, 16]
         # XN while the up stage reads it (``XN_LDS_TOKENS``), then the down
         # stage's MID columns (``stage_slot_mid``)
         pool: fx.Array[fx.Int32, pool_words(s), 16]
