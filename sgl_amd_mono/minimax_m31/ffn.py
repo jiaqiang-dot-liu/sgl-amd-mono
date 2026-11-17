@@ -359,13 +359,19 @@ def oproj(c, task):
     s, tid, lane, wave, a = c["S"], c["tid"], c["lane"], c["wave"], c["args"]
     k = ATTN_K
     vw, steps = oproj_split(s)
-    chains = 2  # smallm's accumulator chains: step pair p on chain p % 2
+    # smallm's accumulator chains: step pair p on chain p % 2. A GEMM of fewer
+    # waves than the CTA's runs a chain a wave (``cpw`` of them), the pairs
+    # p = ch, ch + 2 of its chain ch; the epilogue adds the chains, then waves
+    cpw = WAVES // vw
+    assert cpw in (1, 2) and (cpw == 1 or steps == 8)
+    chains = 2 // cpw
+    offs = list(range(steps)) if cpw == 1 else [0, 1, 4, 5]
     row, kc = lane % 16, (lane // 16) * 16
-    k0 = wave * steps * 64
+    k0 = (wave // cpw) * steps * 64 + (wave % cpw) * 128
     nb = task * OP_TILES
     pool, fpool = c["pool"], c["fpool"]
     # waves past the GEMM's run on zero-sized buffers: their tiles are never summed
-    live = fx.Int64(uniform((wave < vw).select(fx.Int32(-1), fx.Int32(0))))
+    live = fx.Int64(uniform((wave < vw * cpw).select(fx.Int32(-1), fx.Int32(0))))
     rx = rsrc(a["attn"], fx.Int64(s * k * 2) & live)
     rw = rsrc(a["wo"], live)
 
@@ -385,7 +391,7 @@ def oproj(c, task):
             )
             for h in range(2)
         ]
-        for i in range(steps)
+        for i in offs
     ]
     wvs = [
         [
@@ -398,7 +404,7 @@ def oproj(c, task):
                     cache_modifier=CM_NT,
                 )
             )
-            for i in range(steps)
+            for i in offs
         ]
         for tt in range(OP_TILES)
     ]
@@ -407,7 +413,7 @@ def oproj(c, task):
     gpu.barrier()
     # every row's amax over K, as a nonnegative f32's bits
     mx = fx.Int32(0)
-    for i in range_constexpr(steps):
+    for i in range_constexpr(len(offs)):
         for h in range_constexpr(2):
             for d in range_constexpr(4):
                 word = fx.Int32(xvs[i][h][d])
@@ -426,7 +432,7 @@ def oproj(c, task):
         for _ in range(OP_TILES)
     ]
     xq = []
-    for i in range_constexpr(steps):
+    for i in range_constexpr(len(offs)):
         vals = []
         for h in range_constexpr(2):
             for d in range_constexpr(4):
@@ -439,7 +445,7 @@ def oproj(c, task):
                     )
         xq.append([fp8_pack4(*vals[4 * j : 4 * j + 4]) for j in range(4)])
     # a 16x16x128 MFMA takes two steps
-    for p in range_constexpr(steps // 2):
+    for p in range_constexpr(len(offs) // 2):
         x8 = fx.Vector.from_elements(xq[2 * p] + xq[2 * p + 1], fx.Int32)
         for tt in range_constexpr(OP_TILES):
             w8 = fx.Vector.from_elements(
@@ -468,7 +474,15 @@ def oproj(c, task):
         if (e < OP_TILES * 256) & (m < s):
             v = fx.Float32(0.0)
             for w in range_constexpr(vw):
-                v = v + fx.ptr_load(fpool + (OP_RED + w * OP_TILES * 256 + e))
+                if const_expr(cpw == 1):
+                    v = v + fx.ptr_load(fpool + (OP_RED + w * OP_TILES * 256 + e))
+                else:
+                    v = v + (
+                        fx.ptr_load(fpool + (OP_RED + 2 * w * OP_TILES * 256 + e))
+                        + fx.ptr_load(
+                            fpool + (OP_RED + (2 * w + 1) * OP_TILES * 256 + e)
+                        )
+                    )
             amax = fx.ptr_load(pool + (OP_AMAX + m)).bitcast(fx.Float32)
             ws = fx.Float32(
                 bo.buffer_load(rsrc(a["wos"]), nb * 16 + n, vec_width=1, dtype=T.f32)
