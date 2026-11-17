@@ -120,6 +120,7 @@ XN_ROW = HIDDEN // 2 + 4  # dwords of a token's XN in LDS, 16 bytes off the bank
 XMID_ROW = INTER // 2 + 4  # dwords of a pick's MID in LDS, likewise
 K1_STEPS = HIDDEN // 128
 K2_STEPS = INTER // 128
+MID_BATCH = 6  # MID loads out at a time: the slot's down weights hold most registers
 # a CTA's last routed up units that publish their UPF each (``drained``)
 UPF_TAIL = 2
 UP_WAVE_STEPS = K1_STEPS // WAVES
@@ -1042,9 +1043,24 @@ def up_weights(c, rgs, st0, shared=False, nbytes=None):
 
 
 @flyc.jit
-def down_slot(c, u, tasks, shared=False):
-    """Slot u's down GEMV over every task's 16 rows -> LDS ``CONTRIB``."""
+def down_slot(c, u, tasks, nu, shared=False, mid_first=False):
+    """Slot u's down GEMV over every task's 16 rows -> LDS ``CONTRIB``.
+
+    ``mid_first``: the wave's previous slot saw slot u's UPF tiles carry this
+    launch's tag (its probe, then its acquire), so slot u skips the poll and its
+    acquire: the MID round trip then runs under the weights in flight instead of
+    after them. Returns whether the wave's next slot is ready, wave-uniform."""
     lane, wave, a = c["lane"], c["wave"], c["args"]
+    probe = c["S"] > 1
+    words0 = None
+    if const_expr(mid_first):
+        # a ready slot: its MID's first batch goes out ahead of the weights, so
+        # its LDS stores wait on MID alone and run under the weights in flight
+        cnt = slot_count(c, u)
+        k = (u - wave) // WAVES
+        # a lane's MID loads span tiles other lanes acquired
+        wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 1))
+        words0 = mid_loads(c, u, cnt, 0)
     if const_expr(shared):
         rgs = list(tasks)
         wvs = [a16w8.weight_loads(a["w2s"], rg, INTER, 0, K2_STEPS) for rg in rgs]
@@ -1054,13 +1070,32 @@ def down_slot(c, u, tasks, shared=False):
         rgs = [e * DOWN_TASKS + task for task in tasks]
         wvs = [weight_loads(a["w2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
         svs = [scale_loads(a["s2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
-    cnt = slot_count(c, u)
-    c["mb"].poll([(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)])
-    c["mb"].acquire(Space.SCRATCH)
-    k = (u - wave) // WAVES
-    # a lane's MID loads span tiles other lanes polled
-    wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 1))
-    stage_slot_mid(c, u, cnt)
+    if const_expr(mid_first):
+        mid_stores(c, u, cnt, 0, words0)
+        if const_expr(mid_iters(c) > MID_BATCH):
+            if MID_BATCH * 64 < cnt * (INTER // 8):
+                stage_slot_mid(c, u, cnt, MID_BATCH)
+                # nothing of the batches left pending past the branch
+                rocdl.s_waitcnt(vmcnt=0)
+    else:
+        cnt = slot_count(c, u)
+        c["mb"].poll([(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)])
+        c["mb"].acquire(Space.SCRATCH)
+        k = (u - wave) // WAVES
+        # a lane's MID loads span tiles other lanes polled
+        wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 1))
+        stage_slot_mid(c, u, cnt)
+    nxt_tag = fx.Int32(0)
+    if const_expr(probe):
+        # the next slot's UPF tiles' tag words, one a lane, past this slot's
+        # loads: the MFMAs below wait on the weights only (a pair's value word
+        # loaded too would be dead, and its register's reuse a drain)
+        nxt = fx.min(u + WAVES, nu - 1)
+        nxt_tag = load32(
+            c["upf"].value,
+            2 * (nxt * UP_TILES + fx.min(lane, UP_TILES - 1)) + 1,
+            "agent",
+        )
     # and its B reads span chunks other lanes stored
     wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 2))
     col = slot_col(c, cnt)
@@ -1089,33 +1124,59 @@ def down_slot(c, u, tasks, shared=False):
                     c["contrib"]
                     + ((ti * picks(c["S"]) + pick) * 16 + 4 * (lane // 16) + q),
                 )
+    nready = fx.Int32(0)
+    if const_expr(probe):
+        # an acquire after the probe that saw every tile's tag (as a poll's)
+        c["mb"].acquire(Space.SCRATCH)
+        seen = ballot(nxt_tag == c["mb"].tag)
+        nready = uniform(
+            ((seen == fx.Int64(-1)) & (u + WAVES < nu)).select(fx.Int32(1), fx.Int32(0))
+        )
+    return nready
+
+
+def mid_iters(c):
+    return -(-c["S"] * (INTER // 8) // 64)
 
 
 @flyc.jit
-def stage_slot_mid(c, u, cnt):
-    """Slot u's ``cnt`` MID columns -> LDS ``XMID[pick]``, a 16-byte chunk a
-    lane a load, every load out before a store: each lane loading its own B
-    would repeat the last column's ``16 - cnt`` times."""
-    s, lane = c["S"], c["lane"]
+def mid_loads(c, u, cnt, b):
+    """Batch ``b`` .. of slot u's MID chunks (``stage_slot_mid``), loaded."""
+    lane = c["lane"]
     row = INTER // 8
     n = cnt * row
-    iters = -(-s * row // 64)
-    # six loads out at a time: the slot's down weights hold most registers
-    for b in range_constexpr(0, iters, 6):
-        words = []
-        for i in range_constexpr(b, min(b + 6, iters)):
-            w = fx.Vector(_llvm.mlir_undef(T.vec(4, T.i32)))
-            if i * 64 < n:
-                v = fx.min(lane + 64 * i, n - 1)
-                at = (u * 16 + v // row) * (INTER // 2) + v % row * 4
-                w = load_dev(c["mid"].value, at, 4)
-            words.append(w)
-        for i in range_constexpr(b, min(b + 6, iters)):
-            if i * 64 < n:
-                v = fx.min(lane + 64 * i, n - 1)
-                pick = tab_ld(c, T_SLOT_PICK + u * 16 + v // row)
-                at = pick * XMID_ROW + v % row * 4
-                fx.ptr_store(words[i - b], c["xmid"] + at)
+    words = []
+    for i in range_constexpr(b, min(b + MID_BATCH, mid_iters(c))):
+        w = fx.Vector(_llvm.mlir_undef(T.vec(4, T.i32)))
+        if i * 64 < n:
+            v = fx.min(lane + 64 * i, n - 1)
+            at = (u * 16 + v // row) * (INTER // 2) + v % row * 4
+            w = load_dev(c["mid"].value, at, 4)
+        words.append(w)
+    return words
+
+
+@flyc.jit
+def mid_stores(c, u, cnt, b, words):
+    """Batch ``b``'s loaded MID chunks -> LDS ``XMID[pick]``."""
+    lane = c["lane"]
+    row = INTER // 8
+    n = cnt * row
+    for i in range_constexpr(b, min(b + MID_BATCH, mid_iters(c))):
+        if i * 64 < n:
+            v = fx.min(lane + 64 * i, n - 1)
+            pick = tab_ld(c, T_SLOT_PICK + u * 16 + v // row)
+            at = pick * XMID_ROW + v % row * 4
+            fx.ptr_store(words[i - b], c["xmid"] + at)
+
+
+@flyc.jit
+def stage_slot_mid(c, u, cnt, b0=0):
+    """Slot u's ``cnt`` MID columns (from batch ``b0``) -> LDS ``XMID[pick]``, a
+    16-byte chunk a lane a load, every load of a batch out before a store: each
+    lane loading its own B would repeat the last column's ``16 - cnt`` times."""
+    for b in range_constexpr(b0, mid_iters(c), MID_BATCH):
+        mid_stores(c, u, cnt, b, mid_loads(c, u, cnt, b))
 
 
 @flyc.jit
@@ -1128,12 +1189,22 @@ def stage_down(c, tasks):
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     nt = len(tasks)
     nu = n_slots(c)
-    for u in range(wave, nu, WAVES):
-        # slot 0 is the shared expert's (``shared_slot``), its weights MXFP8
-        if u == 0:
-            down_slot(c, u, tasks, shared=True)
-        else:
-            down_slot(c, u, tasks)
+    ready = fx.Int32(0)
+    if const_expr(s > 1):
+        for u in range(wave, nu, WAVES):
+            # slot 0 is the shared expert's (``shared_slot``), its weights MXFP8
+            if u == 0:
+                ready = down_slot(c, u, tasks, nu, shared=True)
+            elif ready != 0:
+                ready = down_slot(c, u, tasks, nu, mid_first=True)
+            else:
+                ready = down_slot(c, u, tasks, nu)
+    else:
+        for u in range(wave, nu, WAVES):
+            if u == 0:
+                down_slot(c, u, tasks, nu, shared=True)
+            else:
+                down_slot(c, u, tasks, nu)
     gpu.barrier()
     if tid < nt * s * 8:
         ti = tid // (s * 8)
