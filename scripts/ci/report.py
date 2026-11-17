@@ -249,7 +249,10 @@ def compare_base(r, name, c):
     """Hold the PR's failing ``name`` tests against the base branch's.
 
     Returns ``(new, why)``: ``new`` lists the PR's failures the base branch does
-    not have, or has failing another way (another exception type). When the two
+    not have, or has failing another way (another message: the same failure on
+    both prints the same exception and text, masked of paths and addresses by
+    run_model.py, so a PR that makes a failing test fail differently, such as a
+    new hash in a drift test or a worse value, is held to it). When the two
     cannot be compared, ``new`` is None and ``why`` says why (None when the run
     has no base tests at all: the nightly, or tests the base side does not run).
     """
@@ -263,13 +266,13 @@ def compare_base(r, name, c):
             return None, f"pytest exited {x.get('rc')} on {side}"
         if len(x.get("failed_ids", [])) != x["failed"]:
             return None, f"no per-test results on {side}"
-    pr, base = _kinds(c), _kinds(b)
-    return sorted(i for i in pr if i not in base or pr[i] != base[i]), None
+    pr, base = _msgs(c), _msgs(b)
+    return sorted(i for i in pr if pr[i] is None or pr[i] != base.get(i)), None
 
 
-def _kinds(c):
-    kinds = c.get("failed_kinds", {})
-    return {i: kinds.get(i) for i in c["failed_ids"]}
+def _msgs(c):
+    msgs = c.get("failed_msgs", {})
+    return {i: msgs.get(i) for i in c["failed_ids"]}
 
 
 def _names(ids, n=3):
@@ -299,7 +302,7 @@ def tests_check(key, r):
         s = f"{name} {c['passed']} passed"
         new, why = compare_base(r, name, c) if c["failed"] else (None, None)
         if new == []:
-            # every failure also fails on the base branch, the same way: the
+            # every failure also fails on the base branch, with the same message: the
             # PR's tests pass
             states.append(WARN)
             s += (

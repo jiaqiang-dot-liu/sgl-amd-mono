@@ -16,11 +16,11 @@ differ only in the package or in ``--enable-amd-monokernel``. Sides:
   is kept as the monokernel-off reference (``monokernel_off_ref``) and reused
   until the next weekly run.
 
-PR mode: the base branch's unit tests, base, then the unit, kernel and timing
-tests, on and off (GSM8K only), then the model's serving tests. A model whose
-``models.py`` entry merged before its package has no base package; its off side
-runs the speed test as its base. (A
-model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
+PR mode: the base branch's unit tests (kept per merge-base and image, so run
+once), base, then the unit, kernel and timing tests, on and off (GSM8K only),
+then the model's serving tests. A model whose ``models.py`` entry merged before
+its package has no base package; its off side runs the speed test as its base.
+(A model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
 because shared code changed) runs no accuracy benchmark, whose bound its serving
 tests hold, and times only the gate concurrencies.
 
@@ -95,17 +95,17 @@ def per_question(run_dir):
     return {q: right[q] / seen[q] for q in seen}
 
 
-def failure_kind(el):
-    """How a test failed, from its junit ``<failure>``/``<error>`` element: the
-    exception type its message names (``ValueError``, ``ImportError`` for a
-    fixture's), ``AssertionError`` for a bare ``assert``, else the tag. Only the
-    type: the message itself holds values, addresses and paths that change from
-    run to run."""
-    msg = (el.get("message") or "").strip()
-    if msg.startswith("assert "):
-        return "AssertionError"
-    m = re.search(r"\b(\w*(?:Error|Exception|Exit|Interrupt)|Failed)\b", msg)
-    return m.group(1) if m else el.tag
+def failure_signature(el, src):
+    """How a test failed, from its junit ``<failure>``/``<error>`` element: its
+    message (the exception and its text), with what changes between two runs of
+    the same failure masked: the checkout's path, pytest's tmp dirs, object
+    addresses. Two runs fail a test the same way when these match; a PR that makes
+    a failing test fail differently (another hash, file, value) changes it."""
+    msg = el.get("message") or el.tag
+    msg = msg.replace(str(src), "<checkout>")
+    msg = re.sub(r"/tmp/pytest-of-[^/\s]+/pytest-\d+", "<tmp>", msg)
+    msg = re.sub(r"\b0x[0-9a-fA-F]+\b", "0x?", msg)
+    return " ".join(msg.split())[:1000]
 
 
 class Run:
@@ -215,7 +215,7 @@ class Run:
             timeout=timeout,
         )
         counts = {"passed": 0, "failed": 0, "skipped": 0, "rc": rc}
-        kinds = {}
+        sigs = {}
         if xml.exists():
             # one state per test id: a test that fails and then errors in its
             # teardown has two <testcase> entries, and counts once, as failed,
@@ -226,7 +226,7 @@ class Run:
                 bad = [c for c in case if c.tag in ("failure", "error")]
                 if bad:
                     state[tid] = "failed"
-                    kinds.setdefault(tid, failure_kind(bad[0]))
+                    sigs.setdefault(tid, failure_signature(bad[0], src))
                 elif any(c.tag == "skipped" for c in case):
                     state.setdefault(tid, "skipped")
                 else:
@@ -236,8 +236,8 @@ class Run:
             # every failure by id and how it failed, so the report can tell the
             # PR's own from the base branch's (a run that failed whole has none:
             # it judges by count)
-            counts["failed_ids"] = sorted(kinds)
-            counts["failed_kinds"] = kinds
+            counts["failed_ids"] = sorted(sigs)
+            counts["failed_msgs"] = sigs
         elif rc:
             counts["failed"] = 1  # collection or the run itself failed
         if rc == 124:
@@ -690,11 +690,40 @@ class Run:
         if serve:
             self.side("base", True)
 
+    def base_tests_key(self):
+        """The base unit run's name in the cache: its merge-base and image. Every
+        model job of a PR, and every PR on that merge-base, runs the same base
+        tests in the same image, so one run serves them all. None outside the CI."""
+        sha, image = os.environ.get("CI_BASE_SHA", ""), os.environ.get("CI_IMAGE", "")
+        if not (re.fullmatch(r"[0-9a-f]{40}", sha) and image):
+            return None
+        return f"{sha}-{hashlib.sha256(image.encode()).hexdigest()[:12]}.json"
+
     def base_tests(self):
         """The base branch's unit tests, so the PR is held only to the failures it
-        adds: one that fails on the base too is the base branch's, not the PR's.
-        Not installing the base, or not reading its results, turns the comparison
-        off rather than failing the PR, which may be the fix for that install."""
+        adds: one that fails on the base too, the same way, is the base branch's,
+        not the PR's. Not installing the base, or not reading its results, turns
+        the comparison off rather than failing the PR, which may be the fix for
+        that install.
+
+        A whole run (pytest exit 0 or 1, its junit XML read) is kept under
+        ``base_tests_key()``. slurm_job.sh runs this step alone first
+        (``--base-tests-only``), before any of the PR's code, and copies what it
+        staged in ``out/base_tests`` to shared storage, which the container mounts
+        read-only at ``<cache>/base_tests``: the PR's code cannot write a base
+        result that a later PR would be held to. The staged copy is read too (this
+        job's own first step, before the PR's code), in case the copy failed."""
+        key = self.base_tests_key()
+        if key:
+            for d in (Path(self.args.cache) / "base_tests", self.out / "base_tests"):
+                try:
+                    kept = json.loads((d / key).read_text())
+                except (OSError, ValueError):
+                    continue
+                self.result.setdefault("base_tests", {})["unit"] = {**kept, "kept": key}
+                self.log(f"the base branch's unit tests: kept in {d / key}")
+                self.save()
+                return
         try:
             self.install(self.args.base)
             self.pytest(
@@ -707,6 +736,14 @@ class Run:
             self.result.setdefault("base_tests", {})["unit"] = {"error": why}
             self.log(f"{why}: the unit tests are not compared with the base branch")
             self.save()
+            return
+        c = self.result.get("base_tests", {}).get("unit")
+        if key and c and c.get("rc") in (0, 1) and "failed_ids" in c:
+            stage = self.out / "base_tests"
+            stage.mkdir(exist_ok=True)
+            tmp = stage / f".{key}.tmp"
+            tmp.write_text(json.dumps(c, indent=2))
+            tmp.replace(stage / key)
 
     def step(self, name, fn, *args, **kwargs):
         """Run one step; an exception is recorded (the report fails on it) and the
@@ -745,10 +782,18 @@ def main():
     )
     ap.add_argument("--tier", choices=("full", "smoke"), default="full")
     ap.add_argument("--mode", choices=("pr", "nightly", "weekly"), default="pr")
+    ap.add_argument(
+        "--base-tests-only",
+        action="store_true",
+        help="PR mode: run (or find kept) the base branch's unit tests and stop",
+    )
     args = ap.parse_args()
     if args.model != "common" and args.model not in MODELS:
         sys.exit(f"unknown model {args.model}")
     run = Run(args)
+    if args.base_tests_only:
+        run.base_tests()
+        return
     try:
         run.run()
     except Exception as e:  # report what ran; the report marks the error
