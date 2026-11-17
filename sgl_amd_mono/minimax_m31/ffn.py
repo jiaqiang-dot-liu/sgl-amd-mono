@@ -120,6 +120,8 @@ XN_ROW = HIDDEN // 2 + 4  # dwords of a token's XN in LDS, 16 bytes off the bank
 XMID_ROW = INTER // 2 + 4  # dwords of a pick's MID in LDS, likewise
 K1_STEPS = HIDDEN // 128
 K2_STEPS = INTER // 128
+# a CTA's last routed up units that publish their UPF each (``drained``)
+UPF_TAIL = 2
 UP_WAVE_STEPS = K1_STEPS // WAVES
 assert UP_WAVE_STEPS * WAVES == K1_STEPS and UP_WAVE_STEPS % 2 == 0
 
@@ -369,7 +371,22 @@ def oproj(c, task):
 
     # the lane's 16 weight bytes of each tile and step (AITER's (16, 16) shuffle:
     # row l % 16, K bytes 16 (l / 16) .. of each 64-wide step), then its 16 bf16 of
-    # row ``row`` at the same K (rows past s read 0)
+    # row ``row`` at the same K (rows past s read 0). X is issued first: loads
+    # return in order, and the quant's amax waits on X only
+    xvs = [
+        [
+            fx.Vector(
+                bo.buffer_load(
+                    rx,
+                    (row * k + k0 + i * 64 + kc) // 2 + 4 * h,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+            for h in range(2)
+        ]
+        for i in range(steps)
+    ]
     wvs = [
         [
             fx.Vector(
@@ -384,20 +401,6 @@ def oproj(c, task):
             for i in range(steps)
         ]
         for tt in range(OP_TILES)
-    ]
-    xvs = [
-        [
-            fx.Vector(
-                bo.buffer_load(
-                    rx,
-                    (row * k + k0 + i * 64 + kc) // 2 + 4 * h,
-                    vec_width=4,
-                    dtype=T.i32,
-                )
-            )
-            for h in range(2)
-        ]
-        for i in range(steps)
     ]
     if tid < 16:
         fx.ptr_store(fx.Int32(0), pool + (OP_AMAX + tid))
@@ -881,7 +884,9 @@ def x_operands(c, base, row, k_dwords, st0, steps):
 
 
 @flyc.jit
-def stage_up(c, u, j, weights, shared=False, nxt=None):
+def stage_up(
+    c, u, j, weights, shared=False, nxt=None, unit=None, first=None, total=None
+):
     """Slot u's tile pair j: gate rows 16 j .., up rows 768 + 16 j .. of its
     expert over this wave's K steps; waves summed in order; SwiGLU-OAI ->
     bf16 ``MID[u][column][16 j ..]``, then UPF. ``weights``: the pair's
@@ -924,8 +929,35 @@ def stage_up(c, u, j, weights, shared=False, nxt=None):
                 up = up + fx.ptr_load(red + ((w * 2 + 1) * 64 * 4 + at))
             v = _swiglu(g, up).to(fx.BFloat16)
             store16(c["mid"].value, (u * 16 + col) * INTER + j * 16 + r, v, "agent")
-    flag_after_stores(c, c["upf"], u * UP_TILES + j, tid == 0)
+    if const_expr(unit is None):
+        flag_after_stores(c, c["upf"], u * UP_TILES + j, tid == 0)
+    else:
+        pair_flag(c, unit, first, total)
     return ahead
+
+
+def drained(unit, first, total):
+    """Whether routed unit ``unit`` (of a CTA's run from ``first``) publishes its
+    UPF itself: every second one, and the CTA's last ``UPF_TAIL``."""
+    k = (unit - first) // BLOCKS
+    return ((k & 1) == 1) | (unit + UPF_TAIL * BLOCKS >= total)
+
+
+@flyc.jit
+def pair_flag(c, unit, first, total):
+    """UPF of routed units in pairs (``drained``): a drain waits out the next unit's
+    weights in flight too, so an undrained unit's flag rides on the next drain."""
+    tid = c["tid"]
+    dn = uniform(drained(unit, first, total).select(fx.Int32(1), fx.Int32(0)))
+    if dn != 0:
+        rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if (tid == 0) & (dn != 0):
+        c["mb"].publish(c["upf"], UP_TILES + unit, fx.Int32(1))
+        prev = unit - BLOCKS
+        if (prev >= first) & (unit + (UPF_TAIL - 1) * BLOCKS < total):
+            if ((prev - first) // BLOCKS & 1) == 0:
+                c["mb"].put(c["upf"], UP_TILES + prev, fx.Int32(1))
 
 
 def unit_weights(c, unit):
@@ -1201,7 +1233,14 @@ def run_ffn(c, bid):
     stamp(c, 7)
     for unit in range(first, total, BLOCKS):
         weights = stage_up(
-            c, 1 + unit // UP_TILES, unit % UP_TILES, weights, nxt=unit + BLOCKS
+            c,
+            1 + unit // UP_TILES,
+            unit % UP_TILES,
+            weights,
+            nxt=unit + BLOCKS,
+            unit=unit,
+            first=first,
+            total=total,
         )
     stamp(c, 8)
     stage_down_placed(c, bid, first, total)
