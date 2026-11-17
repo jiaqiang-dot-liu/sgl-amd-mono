@@ -52,6 +52,7 @@ from sgl_amd_mono.common.ops import (
     lanes_below,
     peer_bases,
     popcount,
+    read_lane_i32,
     rsrc,
     uniform,
 )
@@ -126,11 +127,15 @@ assert UP_WAVE_STEPS * WAVES == K1_STEPS and UP_WAVE_STEPS % 2 == 0
 NORM0 = FINAL_TASKS
 ROUTER0 = NORM0 + MAX_TOKENS
 # the shared expert's CTAs (128 .. 175) have no prefix task (push and reduce
-# 0 .., norm and route NORM0 .., the router ROUTER0 .. 79): its weights stream
+# 0 .., norm NORM0 .., the router ROUTER0 .. 79): its weights stream
 # from the launch's start
 SHARED0 = SEAM_TASKS
 ROUTED0 = SHARED0 + UP_TILES
 assert SHARED0 + UP_TILES <= NORM0
+# route on CTAs with no prefix task (past the shared expert's, before the norm's):
+# it polls the router's logits as they land, not after its own CTA's XN drain
+ROUTE0 = ROUTED0
+assert ROUTE0 + MAX_TOKENS <= NORM0
 assert (ROUTER0 + ROUTER_TASKS) % BLOCKS <= SEAM_TASKS
 # a shared CTA's first routed unit: NONSHARED ..; the down tasks past a CTA's own
 NONSHARED = BLOCKS - UP_TILES
@@ -672,6 +677,13 @@ def stage_route(c, t):
     quarter = ROUTER_PARTS // 4
     e = tid % EXPERTS
     q = tid // EXPERTS
+    # the selection bias (wave 0's two experts a lane), issued before the wait
+    bias = [
+        fx.Float32(
+            bo.buffer_load(rsrc(a["bias"]), lane + 64 * i, vec_width=1, dtype=T.f32)
+        )
+        for i in range(2)
+    ]
     got = c["mb"].poll(
         [
             (c["logit"], (t * EXPERTS + e) * ROUTER_PARTS + q * quarter + p, 2)
@@ -692,12 +704,6 @@ def stage_route(c, t):
                 tot = tot + fx.ptr_load(red + (qq * EXPERTS + lane + 64 * i))
             logits.append(tot)
         sc = [_sigmoid(logits[i]) for i in range(2)]
-        bias = [
-            fx.Float32(
-                bo.buffer_load(rsrc(a["bias"]), lane + 64 * i, vec_width=1, dtype=T.f32)
-            )
-            for i in range(2)
-        ]
         neg = fx.Float32(float("-inf"))
         val = [sc[i] + bias[i] for i in range(2)]
         val = [fx.isnan(v).select(neg, v) for v in val]
@@ -716,8 +722,11 @@ def stage_route(c, t):
             win = butterfly(cand, (32, 16, 8, 4, 2, 1), fx.min)
             mine0 = win == lane
             mine1 = win == lane + 64
-            w_mine = mine0.select(sc[0], mine1.select(sc[1], fx.Float32(0.0)))
-            w = butterfly(w_mine, (32, 16, 8, 4, 2, 1), fx.max)
+            # the winner's sigmoid, read from its lane (every lane holds ``win``)
+            wu = uniform(win)
+            w = read_lane_i32(
+                (wu >= 64).select(sc[1], sc[0]).bitcast(fx.Int32), wu & 63
+            ).bitcast(fx.Float32)
             taken[0] = mine0.select(fx.Int32(1), taken[0])
             taken[1] = mine1.select(fx.Int32(1), taken[1])
             total = total + w
@@ -1170,7 +1179,7 @@ def run_ffn(c, bid):
     for task in range(first_task(bid, ROUTER0), ROUTER_TASKS, BLOCKS):
         stage_router(c, task)
     stamp(c, 4)
-    for t in range(first_task(bid, NORM0), s, BLOCKS):
+    for t in range(first_task(bid, ROUTE0), s, BLOCKS):
         stage_route(c, t)
     gpu.barrier()
     stamp(c, 5)
