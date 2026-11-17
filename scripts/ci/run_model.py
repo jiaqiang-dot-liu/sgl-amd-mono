@@ -545,10 +545,14 @@ class Run:
             ):
                 self.write_monokernel_off_ref("perf", off)
 
+    def trust_checkouts(self):
+        # the checkouts belong to the job's user, not the container's root: git
+        # (and so pip's editable install) refuses them otherwise
+        self.sh("git config --global --add safe.directory '*'", "setup")
+
     def run(self):
         a = self.args
-        # the checkouts belong to the job's user, not the container's root
-        self.sh("git config --global --add safe.directory '*'", "setup")
+        self.trust_checkouts()
         self.sh(f"pip install -q {SGL_EVAL}", "setup")
         self.result["sglang"] = subprocess.run(
             "git -C /sgl-workspace/sglang log -1 --format='%h %cs %s'",
@@ -792,6 +796,7 @@ def main():
         sys.exit(f"unknown model {args.model}")
     run = Run(args)
     if args.base_tests_only:
+        run.trust_checkouts()
         run.base_tests()
         return
     try:
